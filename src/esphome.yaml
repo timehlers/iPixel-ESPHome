@@ -12,8 +12,12 @@ esp32:
   board: "{{BOARD}}"
   framework:
     type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP_TASK_WDT: y
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "30"
 
 # Enable logging
 logger:
+  level: VERBOSE  # or VERY_VERBOSE for maximum detail
 
 captive_portal:

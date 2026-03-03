@@ -1,0 +1,259 @@
+#external_components:
+  # Updated for 2025.11.2
+  #- source: github://hlfcode/esphome@f8324b793040cdd6308db176c04f80777932398d
+#  - source: github://hlfcode/esphome@main
+#    components: [ http_request ]
+    #refresh: 0s
+
+text:
+  - platform: template
+    name: "GIF URL"
+    id: gif_url
+    mode: text
+    icon: "mdi:web"
+    optimistic: true
+    initial_value: "http://www.ehlers.info/ipixel-test.gif"  # Example URL
+
+number:
+  - platform: template
+    name: GIF Chunk Size
+    id: gif_chunk_size
+    icon: mdi:arrow-expand-horizontal
+    optimistic: true
+    min_value: 20
+    max_value: 300
+    initial_value: 300
+    step: 1
+
+  - platform: template
+    name: GIF Chunk Delay (ms)
+    id: gif_chunk_delay_ms
+    icon: mdi:timer-outline
+    optimistic: true
+    min_value: 0
+    max_value: 200
+    initial_value: 30
+    step: 1
+
+globals:
+  - id: gif_command
+    type: std::vector<uint8_t>
+  - id: gif_chunk_index
+    type: int
+    initial_value: '0'
+  - id: gif_ready
+    type: bool
+    initial_value: 'false'
+
+script:
+  - id: send_gif_ble
+    mode: restart
+    then:
+      - lambda: |-
+          size_t max_chunk_size = static_cast<size_t>(id(gif_chunk_size).state);
+          if (max_chunk_size < 20) max_chunk_size = 20;
+          if (max_chunk_size > 300) max_chunk_size = 300;
+          size_t idx = static_cast<size_t>(id(gif_chunk_index));
+          size_t start = idx * max_chunk_size;
+          auto &cmd = id(gif_command);
+
+          if (start >= cmd.size()) {
+            ESP_LOGI("gif", "All chunks sent");
+            return;
+          }
+          size_t len = std::min(max_chunk_size, cmd.size() - start);
+          size_t total_chunks = (cmd.size() + max_chunk_size - 1) / max_chunk_size;
+          if (idx == 0 || (idx + 1) == total_chunks || (idx % 25) == 0) {
+            ESP_LOGI("gif", "Sending chunk %u/%u (%u bytes)", (unsigned) (idx + 1), (unsigned) total_chunks, (unsigned) len);
+          }
+
+      - ble_client.ble_write:
+          id: ble_matrix
+          service_uuid: '00FA'
+          characteristic_uuid: '0000FA02-0000-1000-8000-00805F9B34FB'
+          value: !lambda |-
+            size_t max_chunk_size = static_cast<size_t>(id(gif_chunk_size).state);
+            if (max_chunk_size < 20) max_chunk_size = 20;
+            if (max_chunk_size > 300) max_chunk_size = 300;
+            size_t idx = static_cast<size_t>(id(gif_chunk_index));
+            size_t start = idx * max_chunk_size;
+            auto &cmd = id(gif_command);
+            if (start >= cmd.size()) {
+              return std::vector<uint8_t>{};
+            }
+            size_t len = std::min(max_chunk_size, cmd.size() - start);
+            return std::vector<uint8_t>(cmd.begin() + start, cmd.begin() + start + len);
+
+      - lambda: |-
+          id(gif_chunk_index)++;
+          size_t max_chunk_size = static_cast<size_t>(id(gif_chunk_size).state);
+          if (max_chunk_size < 20) max_chunk_size = 20;
+          if (max_chunk_size > 300) max_chunk_size = 300;
+          int delay_ms = static_cast<int>(id(gif_chunk_delay_ms).state);
+          if (delay_ms < 0) delay_ms = 0;
+          if (delay_ms > 200) delay_ms = 200;
+          size_t next_start = static_cast<size_t>(id(gif_chunk_index)) * max_chunk_size;
+          if (next_start < id(gif_command).size()) {
+            // send next chunk
+            if (delay_ms > 0) {
+              delay(delay_ms);
+            }
+            id(send_gif_ble).execute();
+          } else {
+            ESP_LOGI("gif", "Finished sending all chunks.");
+          }
+
+http_request:
+  verify_ssl: true
+
+button:
+  - platform: template
+    name: GIF Send (Download)
+    id: send_gif
+    icon: mdi:download
+    on_press:
+      - http_request.get:
+          url: !lambda 'return id(gif_url).state;'
+          capture_response: true
+          max_response_buffer_size: 12288
+          #max_response_buffer_size: 40000
+          on_response:
+            - lambda: |-
+                id(gif_ready) = false;
+                // Function to compute CRC32
+                auto crc32 = [](const uint8_t* data, size_t length) -> uint32_t {
+                  uint32_t crc = 0xFFFFFFFF;
+                  for (size_t i = 0; i < length; ++i) {
+                    crc ^= data[i];
+                    for (int j = 0; j < 8; ++j) {
+                      if (crc & 1) {
+                        crc = (crc >> 1) ^ 0xEDB88320;
+                      } else {
+                        crc >>= 1;
+                      }
+                    }
+                  }
+                  return ~crc;
+                };
+
+                // Retrieve the body of the HTTP response (GIF bytes)
+                ESP_LOGD("gif", "HTTP Response status: %d", response->status_code);
+                if (response->status_code != 200) {
+                  ESP_LOGE("gif", "HTTP Error: status code %d", response->status_code);
+                  return;  // Error if not 200 OK
+                }
+
+                ESP_LOGD("gif", "GIF body size: %d bytes", body.size());
+                if (body.empty()) {
+                  ESP_LOGE("gif", "GIF body is empty!");
+                  return;
+                }
+                const size_t MAX_GIF_BYTES = 12000;
+                if (body.size() > MAX_GIF_BYTES) {
+                  ESP_LOGE("gif", "GIF too large for safe processing: %u > %u bytes", (unsigned) body.size(), (unsigned) MAX_GIF_BYTES);
+                  ESP_LOGE("gif", "Device limit reached. Use a smaller/optimized GIF (<= 12 KB).");
+                  return;
+                }
+
+                // Log first bytes of GIF to verify it's a valid GIF
+                if (body.size() >= 8) {
+                  const uint8_t *gif_ptr = reinterpret_cast<const uint8_t *>(body.data());
+                  ESP_LOGD("gif", "GIF signature: %02X %02X %02X %02X %02X %02X %02X %02X",
+                           gif_ptr[0], gif_ptr[1], gif_ptr[2], gif_ptr[3],
+                           gif_ptr[4], gif_ptr[5], gif_ptr[6], gif_ptr[7]);
+                }
+
+                // Apply send_gif logic - travailler directement avec les bytes (plus efficace)
+                uint32_t gif_size = body.size();
+                ESP_LOGI("gif", "GIF size: %u bytes", gif_size);
+
+                // Calculate checksum CRC32 of gif_bytes
+                uint32_t crc = crc32(reinterpret_cast<const uint8_t *>(body.data()), body.size());
+                ESP_LOGI("gif", "CRC32: 0x%08X", crc);
+
+                // Protocol size fields (match iPixel-CLI behavior):
+                // - size field in body = GIF payload size
+                // - 2-byte prefix = full frame length INCLUDING those 2 bytes
+                uint16_t inner_size = static_cast<uint16_t>(13 + gif_size);      // 030000 + size(4) + crc(4) + 0201 + gif
+                uint16_t frame_size = static_cast<uint16_t>(inner_size + 2);     // include prefix bytes
+                ESP_LOGD("gif", "Inner bytes size: %u bytes", inner_size);
+                
+                // Vérifier la taille maximale supportée par BLE
+                // MTU BLE standard: 23 bytes, négociable jusqu'à 512 bytes
+                // Si la commande dépasse ~500 bytes, il faudra fragmenter
+                const uint16_t MAX_BLE_PACKET_SIZE = 300; // Taille max recommandée
+
+                if (inner_size > MAX_BLE_PACKET_SIZE) {
+                  ESP_LOGW("gif", "Command size (%u bytes) exceeds recommended BLE packet size (%u bytes)", inner_size, MAX_BLE_PACKET_SIZE);
+                  ESP_LOGW("gif", "BLE may fragment or fail. Consider using a smaller GIF.");
+                }
+
+                // Build final command: header_size (2 bytes LE) + 030000 + size (4 bytes LE) + crc (4 bytes LE) + 0201 + gif_bytes
+                auto &command = id(gif_command);
+                command.clear();
+                command.reserve(static_cast<size_t>(15 + gif_size));
+                // Header size (2 bytes, little-endian)
+                command.push_back(frame_size & 0xFF);
+                command.push_back((frame_size >> 8) & 0xFF);
+                // 030000
+                command.push_back(0x03);
+                command.push_back(0x00);
+                command.push_back(0x00);
+                // Size (4 bytes, little-endian)
+                command.push_back(gif_size & 0xFF);
+                command.push_back((gif_size >> 8) & 0xFF);
+                command.push_back((gif_size >> 16) & 0xFF);
+                command.push_back((gif_size >> 24) & 0xFF);
+                // CRC32 (4 bytes, little-endian)
+                command.push_back(crc & 0xFF);
+                command.push_back((crc >> 8) & 0xFF);
+                command.push_back((crc >> 16) & 0xFF);
+                command.push_back((crc >> 24) & 0xFF);
+                // 0201
+                command.push_back(0x02);
+                command.push_back(0x01);
+                // GIF bytes
+                command.insert(command.end(), body.begin(), body.end());
+
+                // Log command details
+                ESP_LOGI("gif", "Command built successfully");
+                ESP_LOGI("gif", "Command total size: %u bytes", command.size());
+                ESP_LOGI("gif", "Command header size: %u bytes (LE)", frame_size);
+                ESP_LOGI("gif", "GIF size in command: %u bytes (LE)", gif_size);
+                ESP_LOGI("gif", "CRC32 in command: 0x%08X (LE)", crc);
+
+                // Log first 32 bytes of command for debugging
+                if (command.size() > 0) {
+                  char hex_str[97]; // 32 bytes * 3 chars (2 hex + space) + null
+                  hex_str[0] = '\0';
+                  int max_bytes = command.size() < 32 ? command.size() : 32;
+                  for (int i = 0; i < max_bytes; i++) {
+                    char byte_str[4];
+                    sprintf(byte_str, "%02X ", command[i]);
+                    strcat(hex_str, byte_str);
+                  }
+                  ESP_LOGD("gif", "Command first %d bytes: %s", max_bytes, hex_str);
+                }
+
+                // Store one command buffer and chunk during send to reduce peak RAM.
+                id(gif_chunk_index) = 0;
+                id(gif_ready) = true;
+                size_t chunk_sz = static_cast<size_t>(id(gif_chunk_size).state);
+                if (chunk_sz < 20) chunk_sz = 20;
+                if (chunk_sz > 300) chunk_sz = 300;
+                int delay_ms = static_cast<int>(id(gif_chunk_delay_ms).state);
+                if (delay_ms < 0) delay_ms = 0;
+                if (delay_ms > 200) delay_ms = 200;
+                size_t chunks = (command.size() + chunk_sz - 1) / chunk_sz;
+                ESP_LOGI("gif", "GIF prepared successfully (%u chunks, chunk=%u, delay=%dms)", (unsigned) chunks, (unsigned) chunk_sz, delay_ms);
+            - if:
+                condition:
+                  lambda: 'return id(gif_ready);'
+                then:
+                  - logger.log: "Starting GIF BLE transfer..."
+                  - script.execute:
+                      id: send_gif_ble
+          on_error:
+            - lambda: |-
+                ESP_LOGE("gif", "HTTP request failed - Cannot download GIF image");
+            - logger.log: Cannot download GIF image.

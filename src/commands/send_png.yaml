@@ -5,50 +5,133 @@ text:
     mode: text
     icon: "mdi:web"
     optimistic: true
-    initial_value: "https://i.ibb.co/GvSV4j12/test.png"  # Example URL
+    initial_value: "http://www.ehlers.info/ipixel-test.png"
+
+number:
+  - platform: template
+    name: PNG Chunk Size
+    id: png_chunk_size
+    icon: mdi:arrow-expand-horizontal
+    optimistic: true
+    min_value: 20
+    max_value: 300
+    initial_value: 300
+    step: 1
+
+  - platform: template
+    name: PNG Chunk Delay (ms)
+    id: png_chunk_delay_ms
+    icon: mdi:timer-outline
+    optimistic: true
+    min_value: 0
+    max_value: 200
+    initial_value: 30
+    step: 1
+
+select:
+  - platform: template
+    name: PNG Protocol Mode
+    id: png_protocol_mode
+    icon: mdi:tune-variant
+    optimistic: true
+    options:
+      - CLI
+      - LegacyLen
+      - AltTail
+      - LegacyAltTail
+    initial_option: CLI
 
 globals:
   - id: png_command
     type: std::vector<uint8_t>
+  - id: png_chunk_index
+    type: int
+    initial_value: '0'
+  - id: png_ready
+    type: bool
+    initial_value: 'false'
 
 script:
   - id: send_png_ble
+    mode: restart
     then:
+      - lambda: |-
+          size_t max_chunk_size = static_cast<size_t>(id(png_chunk_size).state);
+          if (max_chunk_size < 20) max_chunk_size = 20;
+          if (max_chunk_size > 300) max_chunk_size = 300;
+
+          size_t idx = static_cast<size_t>(id(png_chunk_index));
+          size_t start = idx * max_chunk_size;
+          auto &cmd = id(png_command);
+
+          if (start >= cmd.size()) {
+            ESP_LOGI("png", "All chunks sent");
+            return;
+          }
+
+          size_t len = std::min(max_chunk_size, cmd.size() - start);
+          size_t total_chunks = (cmd.size() + max_chunk_size - 1) / max_chunk_size;
+          if (idx == 0 || (idx + 1) == total_chunks || (idx % 25) == 0) {
+            ESP_LOGI("png", "Sending chunk %u/%u (%u bytes)",
+                     (unsigned) (idx + 1), (unsigned) total_chunks, (unsigned) len);
+          }
+
       - ble_client.ble_write:
           id: ble_matrix
           service_uuid: '00FA'
           characteristic_uuid: '0000FA02-0000-1000-8000-00805F9B34FB'
-          value: !lambda 'return id(png_command);'
+          value: !lambda |-
+            size_t max_chunk_size = static_cast<size_t>(id(png_chunk_size).state);
+            if (max_chunk_size < 20) max_chunk_size = 20;
+            if (max_chunk_size > 300) max_chunk_size = 300;
+
+            size_t idx = static_cast<size_t>(id(png_chunk_index));
+            size_t start = idx * max_chunk_size;
+            auto &cmd = id(png_command);
+            if (start >= cmd.size()) {
+              return std::vector<uint8_t>{};
+            }
+            size_t len = std::min(max_chunk_size, cmd.size() - start);
+            return std::vector<uint8_t>(cmd.begin() + start, cmd.begin() + start + len);
+
+      - lambda: |-
+          id(png_chunk_index)++;
+
+          size_t max_chunk_size = static_cast<size_t>(id(png_chunk_size).state);
+          if (max_chunk_size < 20) max_chunk_size = 20;
+          if (max_chunk_size > 300) max_chunk_size = 300;
+
+          int delay_ms = static_cast<int>(id(png_chunk_delay_ms).state);
+          if (delay_ms < 0) delay_ms = 0;
+          if (delay_ms > 200) delay_ms = 200;
+
+          size_t next_start = static_cast<size_t>(id(png_chunk_index)) * max_chunk_size;
+          if (next_start < id(png_command).size()) {
+            if (delay_ms > 0) {
+              delay(delay_ms);
+            }
+            id(send_png_ble).execute();
+          } else {
+            ESP_LOGI("png", "Finished sending all chunks.");
+          }
 
 http_request:
   verify_ssl: true
 
 button:
   - platform: template
-    name: "Download and Send PNG"
+    name: PNG Send (Download)
     id: send_png
-    icon: "mdi:download"
+    icon: mdi:download
     on_press:
       - http_request.get:
           url: !lambda 'return id(png_url).state;'
           capture_response: true
-          max_response_buffer_size: 65536
+          max_response_buffer_size: 12288
           on_response:
             - lambda: |-
-                // Function to switch endian
-                auto switch_endian = [](std::string hex_string) -> std::string {
-                  if (hex_string.length() % 2 != 0) return hex_string;
-                  std::vector<std::string> pairs;
-                  for (size_t i = 0; i < hex_string.length(); i += 2) {
-                    pairs.push_back(hex_string.substr(i, 2));
-                  }
-                  std::reverse(pairs.begin(), pairs.end());
-                  std::string result;
-                  for (auto& p : pairs) result += p;
-                  return result;
-                };
+                id(png_ready) = false;
 
-                // Function to compute CRC32
                 auto crc32 = [](const uint8_t* data, size_t length) -> uint32_t {
                   uint32_t crc = 0xFFFFFFFF;
                   for (size_t i = 0; i < length; ++i) {
@@ -64,81 +147,120 @@ button:
                   return ~crc;
                 };
 
-                // Retrieve the body of the HTTP response (PNG bytes)
+                ESP_LOGD("png", "HTTP Response status: %d", response->status_code);
                 if (response->status_code != 200) {
-                  return;  // Error if not 200 OK
-                }
-
-                std::string png_body = body;
-                std::vector<uint8_t> png_bytes(png_body.begin(), png_body.end());
-                if (png_bytes.empty()) {
+                  ESP_LOGE("png", "HTTP Error: status code %d", response->status_code);
                   return;
                 }
 
-                // Convert to hex string (if necessary for the logic)
-                std::string png_hex;
-                for (uint8_t byte : png_bytes) {
-                  char hex[3];
-                  sprintf(hex, "%02x", byte);
-                  png_hex += hex;
+                ESP_LOGD("png", "PNG body size: %d bytes", body.size());
+                if (body.empty()) {
+                  ESP_LOGE("png", "PNG body is empty!");
+                  return;
                 }
 
-                // Apply send_png logic
-                // Calculate size = png_bytes.size() in hex 8 chars
-                uint32_t png_size = png_bytes.size();
-                char size_str[9];
-                sprintf(size_str, "%08x", png_size);
-                std::string size_hex(size_str);
-                size_hex = switch_endian(size_hex);
-
-                // Calculate checksum CRC32 of png_bytes
-                uint32_t crc = crc32(png_bytes.data(), png_bytes.size());
-                char checksum_str[9];
-                sprintf(checksum_str, "%08x", crc);
-                std::string checksum_hex(checksum_str);
-                checksum_hex = switch_endian(checksum_hex);
-
-                // Build inner = "FFFF020000" + size_hex + checksum_hex + "0065" + png_hex
-                std::string inner = "FFFF020000" + size_hex + checksum_hex + "0065" + png_hex;
-
-                // Convert inner to bytes for length
-                std::vector<uint8_t> inner_bytes;
-                for (size_t i = 0; i < inner.length(); i += 2) {
-                  if (i + 1 >= inner.length()) break;
-                  std::string byteString = inner.substr(i, 2);
-                  char* end;
-                  uint8_t byte = strtol(byteString.c_str(), &end, 16);
-                  if (*end != '\0') continue;
-                  inner_bytes.push_back(byte);
+                const size_t MAX_PNG_BYTES = 12000;
+                if (body.size() > MAX_PNG_BYTES) {
+                  ESP_LOGE("png", "PNG too large for safe processing: %u > %u bytes", (unsigned) body.size(), (unsigned) MAX_PNG_BYTES);
+                  ESP_LOGE("png", "Device limit reached. Use a smaller/optimized PNG (<= 12 KB).");
+                  return;
                 }
 
-                uint32_t total_size = inner_bytes.size();
-                char total_size_str[5];
-                sprintf(total_size_str, "%04x", total_size);
-                std::string header_size(total_size_str);
-                header_size = switch_endian(header_size);
-
-                // Final command = header_size + "020000" + size_hex + checksum_hex + "0065" + png_hex
-                std::string command_hex = header_size + "020000" + size_hex + checksum_hex + "0065" + png_hex;
-
-                // Convert to bytes
-                std::vector<uint8_t> command;
-                for (size_t i = 0; i < command_hex.length(); i += 2) {
-                  if (i + 1 >= command_hex.length()) break;
-                  std::string byteString = command_hex.substr(i, 2);
-                  char* end;
-                  uint8_t byte = strtol(byteString.c_str(), &end, 16);
-                  if (*end != '\0') continue;
-                  command.push_back(byte);
+                if (body.size() >= 8) {
+                  const uint8_t *png_ptr = reinterpret_cast<const uint8_t *>(body.data());
+                  ESP_LOGD("png", "PNG signature: %02X %02X %02X %02X %02X %02X %02X %02X",
+                           png_ptr[0], png_ptr[1], png_ptr[2], png_ptr[3],
+                           png_ptr[4], png_ptr[5], png_ptr[6], png_ptr[7]);
                 }
 
-                // Store the command in the global variable
-                id(png_command) = command;
-                // Trigger BLE sending
-                id(send_png_ble).execute();
+                // Parse IHDR width/height (big-endian) and enforce matrix size.
+                if (body.size() >= 24) {
+                  const uint8_t *p = reinterpret_cast<const uint8_t *>(body.data());
+                  bool has_ihdr = (p[12] == 'I' && p[13] == 'H' && p[14] == 'D' && p[15] == 'R');
+                  if (has_ihdr) {
+                    uint32_t w = (static_cast<uint32_t>(p[16]) << 24) | (static_cast<uint32_t>(p[17]) << 16) |
+                                 (static_cast<uint32_t>(p[18]) << 8) | static_cast<uint32_t>(p[19]);
+                    uint32_t h = (static_cast<uint32_t>(p[20]) << 24) | (static_cast<uint32_t>(p[21]) << 16) |
+                                 (static_cast<uint32_t>(p[22]) << 8) | static_cast<uint32_t>(p[23]);
+                    ESP_LOGI("png", "PNG dimensions: %ux%u", (unsigned) w, (unsigned) h);
+                    if (!(w == 32 && h == 32)) {
+                      ESP_LOGE("png", "Unsupported PNG dimensions for this panel: %ux%u (expected 32x32)", (unsigned) w, (unsigned) h);
+                      ESP_LOGE("png", "Please resize/convert PNG to 32x32 RGB.");
+                      return;
+                    }
+                  }
+                }
+
+                uint32_t png_size = body.size();
+                ESP_LOGI("png", "PNG size: %u bytes", png_size);
+
+                uint32_t crc = crc32(reinterpret_cast<const uint8_t *>(body.data()), body.size());
+                ESP_LOGI("png", "CRC32: 0x%08X", crc);
+
+                uint16_t inner_size = static_cast<uint16_t>(13 + png_size);
+                bool legacy_len = (id(png_protocol_mode).state == "LegacyLen" || id(png_protocol_mode).state == "LegacyAltTail");
+                bool alt_tail = (id(png_protocol_mode).state == "AltTail" || id(png_protocol_mode).state == "LegacyAltTail");
+                uint16_t frame_size = legacy_len ? inner_size : static_cast<uint16_t>(inner_size + 2);
+                ESP_LOGD("png", "Inner bytes size: %u bytes", inner_size);
+
+                const uint16_t MAX_BLE_PACKET_SIZE = 300;
+                if (inner_size > MAX_BLE_PACKET_SIZE) {
+                  ESP_LOGW("png", "Command size (%u bytes) exceeds recommended BLE packet size (%u bytes)", inner_size, MAX_BLE_PACKET_SIZE);
+                  ESP_LOGW("png", "BLE may fragment or fail. Consider using a smaller PNG.");
+                }
+
+                auto &command = id(png_command);
+                command.clear();
+                command.reserve(static_cast<size_t>(15 + png_size));
+
+                command.push_back(frame_size & 0xFF);
+                command.push_back((frame_size >> 8) & 0xFF);
+                command.push_back(0x02);
+                command.push_back(0x00);
+                command.push_back(0x00);
+                command.push_back(png_size & 0xFF);
+                command.push_back((png_size >> 8) & 0xFF);
+                command.push_back((png_size >> 16) & 0xFF);
+                command.push_back((png_size >> 24) & 0xFF);
+                command.push_back(crc & 0xFF);
+                command.push_back((crc >> 8) & 0xFF);
+                command.push_back((crc >> 16) & 0xFF);
+                command.push_back((crc >> 24) & 0xFF);
+                command.push_back(alt_tail ? 0x02 : 0x00);
+                command.push_back(alt_tail ? 0x01 : 0x65);
+                command.insert(command.end(), body.begin(), body.end());
+
+                ESP_LOGI("png", "Command built successfully");
+                ESP_LOGI("png", "Command total size: %u bytes", command.size());
+                ESP_LOGI("png", "Command header size: %u bytes (LE)", frame_size);
+                ESP_LOGI("png", "PNG size in command: %u bytes (LE)", png_size);
+                ESP_LOGI("png", "CRC32 in command: 0x%08X (LE)", crc);
+                ESP_LOGI("png", "Protocol mode: %s", id(png_protocol_mode).state.c_str());
+
+                id(png_chunk_index) = 0;
+                id(png_ready) = true;
+
+                size_t chunk_sz = static_cast<size_t>(id(png_chunk_size).state);
+                if (chunk_sz < 20) chunk_sz = 20;
+                if (chunk_sz > 300) chunk_sz = 300;
+                int delay_ms = static_cast<int>(id(png_chunk_delay_ms).state);
+                if (delay_ms < 0) delay_ms = 0;
+                if (delay_ms > 200) delay_ms = 200;
+                size_t chunks = (command.size() + chunk_sz - 1) / chunk_sz;
+                ESP_LOGI("png", "PNG prepared successfully (%u chunks, chunk=%u, delay=%dms)", (unsigned) chunks, (unsigned) chunk_sz, delay_ms);
+
+            - if:
+                condition:
+                  lambda: 'return id(png_ready);'
+                then:
+                  - select.set:
+                      id: clock_style
+                      option: Disabled
+                  - delay: 120ms
+                  - logger.log: "Starting PNG BLE transfer..."
+                  - script.execute:
+                      id: send_png_ble
           on_error:
-            - logger.log: "Cannot download PNG image."
-      
-      - select.set:
-          id : clock_style
-          option: "Disabled"
+            - lambda: |-
+                ESP_LOGE("png", "HTTP request failed - Cannot download PNG image");
+            - logger.log: Cannot download PNG image.

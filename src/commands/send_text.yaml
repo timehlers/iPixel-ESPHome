@@ -1,0 +1,399 @@
+text:
+  - platform: template
+    name: "Text Message"
+    id: text_message
+    mode: text
+    icon: "mdi:message-text"
+    optimistic: true
+    initial_value: "HELLO"
+
+number:
+  - platform: template
+    name: Text Animation
+    id: text_animation
+    icon: mdi:animation-play
+    optimistic: true
+    min_value: 0
+    max_value: 7
+    initial_value: 1
+    step: 1
+  - platform: template
+    name: Text Speed
+    id: text_speed
+    icon: mdi:speedometer
+    optimistic: true
+    min_value: 0
+    max_value: 100
+    initial_value: 50
+    step: 1
+
+select:
+  - platform: template
+    name: Text Font
+    id: text_font
+    icon: mdi:format-font
+    optimistic: true
+    options:
+      - Classic
+      - Bold
+      - VCR
+    initial_option: Bold
+  - platform: template
+    name: Text Height
+    id: text_height
+    icon: mdi:format-line-height
+    optimistic: true
+    options:
+      - Normal
+      - Compressed
+    initial_option: Compressed
+
+globals:
+  - id: text_command_chunks
+    type: std::vector<std::vector<uint8_t>>
+  - id: text_chunk_index
+    type: int
+    initial_value: '0'
+
+script:
+  - id: send_text_ble
+    mode: restart
+    then:
+      - lambda: |-
+          auto &chunks = id(text_command_chunks);
+          int idx = id(text_chunk_index);
+
+          if (idx >= chunks.size()) {
+            ESP_LOGI("text", "All chunks sent");
+            return;
+          }
+          ESP_LOGI("text", "Sending chunk %d (%d bytes)", idx, chunks[idx].size());
+
+      - ble_client.ble_write:
+          id: ble_matrix
+          service_uuid: '00FA'
+          characteristic_uuid: '0000FA02-0000-1000-8000-00805F9B34FB'
+          value: !lambda |-
+            return id(text_command_chunks)[id(text_chunk_index)];
+
+      - lambda: |-
+          id(text_chunk_index)++;
+          auto &chunks = id(text_command_chunks);
+          if (id(text_chunk_index) < chunks.size()) {
+            id(send_text_ble).execute();
+          } else {
+            ESP_LOGI("text", "Finished sending all chunks.");
+          }
+
+button:
+  - platform: template
+    name: Send Text
+    id: send_text
+    icon: mdi:send
+    on_press:
+      - lambda: |-
+          std::string msg = id(text_message).state;
+          if (msg.empty()) {
+            ESP_LOGW("text", "Text message is empty, nothing to send");
+            return;
+          }
+
+          if (msg.size() > 60) {
+            msg = msg.substr(0, 60);
+            ESP_LOGW("text", "Text truncated to 60 characters");
+          }
+
+          auto reverse_bits_16 = [](uint16_t n) -> uint16_t {
+            n = (n >> 8) | (n << 8);
+            n = ((n & 0xF0F0) >> 4) | ((n & 0x0F0F) << 4);
+            n = ((n & 0xCCCC) >> 2) | ((n & 0x3333) << 2);
+            n = ((n & 0xAAAA) >> 1) | ((n & 0x5555) << 1);
+            return n;
+          };
+
+          auto crc32 = [](const uint8_t* data, size_t length) -> uint32_t {
+            uint32_t crc = 0xFFFFFFFF;
+            for (size_t i = 0; i < length; ++i) {
+              crc ^= data[i];
+              for (int j = 0; j < 8; ++j) {
+                if (crc & 1) {
+                  crc = (crc >> 1) ^ 0xEDB88320;
+                } else {
+                  crc >>= 1;
+                }
+              }
+            }
+            return ~crc;
+          };
+
+          auto get_rows_5x7 = [](char ch) -> std::vector<uint8_t> {
+            switch (ch) {
+              case 'A': return {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11};
+              case 'B': return {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E};
+              case 'C': return {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E};
+              case 'D': return {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E};
+              case 'E': return {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F};
+              case 'F': return {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10};
+              case 'G': return {0x0E,0x11,0x10,0x17,0x11,0x11,0x0E};
+              case 'H': return {0x11,0x11,0x11,0x1F,0x11,0x11,0x11};
+              case 'I': return {0x1F,0x04,0x04,0x04,0x04,0x04,0x1F};
+              case 'J': return {0x1F,0x02,0x02,0x02,0x12,0x12,0x0C};
+              case 'K': return {0x11,0x12,0x14,0x18,0x14,0x12,0x11};
+              case 'L': return {0x10,0x10,0x10,0x10,0x10,0x10,0x1F};
+              case 'M': return {0x11,0x1B,0x15,0x15,0x11,0x11,0x11};
+              case 'N': return {0x11,0x19,0x15,0x13,0x11,0x11,0x11};
+              case 'O': return {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E};
+              case 'P': return {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10};
+              case 'Q': return {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D};
+              case 'R': return {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11};
+              case 'S': return {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E};
+              case 'T': return {0x1F,0x04,0x04,0x04,0x04,0x04,0x04};
+              case 'U': return {0x11,0x11,0x11,0x11,0x11,0x11,0x0E};
+              case 'V': return {0x11,0x11,0x11,0x11,0x11,0x0A,0x04};
+              case 'W': return {0x11,0x11,0x11,0x15,0x15,0x15,0x0A};
+              case 'X': return {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11};
+              case 'Y': return {0x11,0x11,0x0A,0x04,0x04,0x04,0x04};
+              case 'Z': return {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F};
+              case 'a': return {0x00,0x00,0x0E,0x01,0x0F,0x11,0x0F};
+              case 'b': return {0x10,0x10,0x1E,0x11,0x11,0x11,0x1E};
+              case 'c': return {0x00,0x00,0x0F,0x10,0x10,0x10,0x0F};
+              case 'd': return {0x01,0x01,0x0F,0x11,0x11,0x11,0x0F};
+              case 'e': return {0x00,0x00,0x0E,0x11,0x1F,0x10,0x0E};
+              case 'f': return {0x06,0x08,0x1C,0x08,0x08,0x08,0x08};
+              case 'g': return {0x00,0x0F,0x11,0x11,0x0F,0x01,0x0E};
+              case 'h': return {0x10,0x10,0x1E,0x11,0x11,0x11,0x11};
+              case 'i': return {0x04,0x00,0x0C,0x04,0x04,0x04,0x0E};
+              case 'j': return {0x02,0x00,0x06,0x02,0x02,0x12,0x0C};
+              case 'k': return {0x10,0x10,0x12,0x14,0x18,0x14,0x12};
+              case 'l': return {0x0C,0x04,0x04,0x04,0x04,0x04,0x0E};
+              case 'm': return {0x00,0x00,0x1A,0x15,0x15,0x15,0x15};
+              case 'n': return {0x00,0x00,0x1E,0x11,0x11,0x11,0x11};
+              case 'o': return {0x00,0x00,0x0E,0x11,0x11,0x11,0x0E};
+              case 'p': return {0x00,0x1E,0x11,0x11,0x1E,0x10,0x10};
+              case 'q': return {0x00,0x0F,0x11,0x11,0x0F,0x01,0x01};
+              case 'r': return {0x00,0x00,0x16,0x19,0x10,0x10,0x10};
+              case 's': return {0x00,0x00,0x0F,0x10,0x0E,0x01,0x1E};
+              case 't': return {0x08,0x08,0x1C,0x08,0x08,0x08,0x06};
+              case 'u': return {0x00,0x00,0x11,0x11,0x11,0x13,0x0D};
+              case 'v': return {0x00,0x00,0x11,0x11,0x11,0x0A,0x04};
+              case 'w': return {0x00,0x00,0x11,0x15,0x15,0x15,0x0A};
+              case 'x': return {0x00,0x00,0x11,0x0A,0x04,0x0A,0x11};
+              case 'y': return {0x00,0x11,0x11,0x11,0x0F,0x01,0x0E};
+              case 'z': return {0x00,0x00,0x1F,0x02,0x04,0x08,0x1F};
+              case '0': return {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E};
+              case '1': return {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E};
+              case '2': return {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F};
+              case '3': return {0x1E,0x01,0x01,0x0E,0x01,0x01,0x1E};
+              case '4': return {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02};
+              case '5': return {0x1F,0x10,0x10,0x1E,0x01,0x01,0x1E};
+              case '6': return {0x0E,0x10,0x10,0x1E,0x11,0x11,0x0E};
+              case '7': return {0x1F,0x01,0x02,0x04,0x08,0x08,0x08};
+              case '8': return {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E};
+              case '9': return {0x0E,0x11,0x11,0x0F,0x01,0x01,0x0E};
+              case '.': return {0x00,0x00,0x00,0x00,0x00,0x06,0x06};
+              case ',': return {0x00,0x00,0x00,0x00,0x00,0x06,0x04};
+              case ':': return {0x00,0x06,0x06,0x00,0x06,0x06,0x00};
+              case '-': return {0x00,0x00,0x00,0x1F,0x00,0x00,0x00};
+              case '!': return {0x04,0x04,0x04,0x04,0x04,0x00,0x04};
+              case '?': return {0x0E,0x11,0x01,0x02,0x04,0x00,0x04};
+              case ' ': return {0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+              default:  return {0x00,0x00,0x1F,0x11,0x11,0x1F,0x00};
+            }
+          };
+
+          auto get_rows_8x8_vcr = [](char ch) -> std::vector<uint8_t> {
+            switch (ch) {
+              case 'A': return {0x18,0x24,0x42,0x7E,0x42,0x42,0x42,0x00};
+              case 'B': return {0x7C,0x42,0x42,0x7C,0x42,0x42,0x7C,0x00};
+              case 'C': return {0x3C,0x42,0x40,0x40,0x40,0x42,0x3C,0x00};
+              case 'D': return {0x78,0x44,0x42,0x42,0x42,0x44,0x78,0x00};
+              case 'E': return {0x7E,0x40,0x40,0x7C,0x40,0x40,0x7E,0x00};
+              case 'F': return {0x7E,0x40,0x40,0x7C,0x40,0x40,0x40,0x00};
+              case 'G': return {0x3C,0x42,0x40,0x4E,0x42,0x42,0x3C,0x00};
+              case 'H': return {0x42,0x42,0x42,0x7E,0x42,0x42,0x42,0x00};
+              case 'I': return {0x3E,0x08,0x08,0x08,0x08,0x08,0x3E,0x00};
+              case 'J': return {0x1E,0x04,0x04,0x04,0x44,0x44,0x38,0x00};
+              case 'K': return {0x42,0x44,0x48,0x70,0x48,0x44,0x42,0x00};
+              case 'L': return {0x40,0x40,0x40,0x40,0x40,0x40,0x7E,0x00};
+              case 'M': return {0x42,0x66,0x5A,0x5A,0x42,0x42,0x42,0x00};
+              case 'N': return {0x42,0x62,0x52,0x4A,0x46,0x42,0x42,0x00};
+              case 'O': return {0x3C,0x42,0x42,0x42,0x42,0x42,0x3C,0x00};
+              case 'P': return {0x7C,0x42,0x42,0x7C,0x40,0x40,0x40,0x00};
+              case 'Q': return {0x3C,0x42,0x42,0x42,0x4A,0x44,0x3A,0x00};
+              case 'R': return {0x7C,0x42,0x42,0x7C,0x48,0x44,0x42,0x00};
+              case 'S': return {0x3C,0x42,0x40,0x3C,0x02,0x42,0x3C,0x00};
+              case 'T': return {0x7F,0x08,0x08,0x08,0x08,0x08,0x08,0x00};
+              case 'U': return {0x42,0x42,0x42,0x42,0x42,0x42,0x3C,0x00};
+              case 'V': return {0x42,0x42,0x42,0x42,0x24,0x24,0x18,0x00};
+              case 'W': return {0x42,0x42,0x42,0x5A,0x5A,0x66,0x42,0x00};
+              case 'X': return {0x42,0x24,0x24,0x18,0x24,0x24,0x42,0x00};
+              case 'Y': return {0x42,0x24,0x24,0x18,0x08,0x08,0x08,0x00};
+              case 'Z': return {0x7E,0x04,0x08,0x10,0x20,0x40,0x7E,0x00};
+              case '0': return {0x3C,0x46,0x4A,0x52,0x62,0x42,0x3C,0x00};
+              case '1': return {0x08,0x18,0x28,0x08,0x08,0x08,0x3E,0x00};
+              case '2': return {0x3C,0x42,0x02,0x0C,0x30,0x40,0x7E,0x00};
+              case '3': return {0x7E,0x04,0x18,0x0C,0x02,0x42,0x3C,0x00};
+              case '4': return {0x0C,0x14,0x24,0x44,0x7E,0x04,0x04,0x00};
+              case '5': return {0x7E,0x40,0x7C,0x02,0x02,0x42,0x3C,0x00};
+              case '6': return {0x1C,0x20,0x40,0x7C,0x42,0x42,0x3C,0x00};
+              case '7': return {0x7E,0x02,0x04,0x08,0x10,0x10,0x10,0x00};
+              case '8': return {0x3C,0x42,0x42,0x3C,0x42,0x42,0x3C,0x00};
+              case '9': return {0x3C,0x42,0x42,0x3E,0x02,0x04,0x38,0x00};
+              case '.': return {0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00};
+              case ',': return {0x00,0x00,0x00,0x00,0x00,0x18,0x10,0x20};
+              case ':': return {0x00,0x18,0x18,0x00,0x18,0x18,0x00,0x00};
+              case '-': return {0x00,0x00,0x00,0x7E,0x00,0x00,0x00,0x00};
+              case '!': return {0x18,0x18,0x18,0x18,0x18,0x00,0x18,0x00};
+              case '?': return {0x3C,0x42,0x02,0x0C,0x10,0x00,0x10,0x00};
+              case ' ': return {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+              default:  return {0x00,0x00,0x7E,0x42,0x42,0x7E,0x00,0x00};
+            }
+          };
+
+          auto encode_char_8x16 = [&](char ch, bool bold, bool vcr, bool compressed) -> std::vector<uint8_t> {
+            std::vector<uint8_t> src = vcr ? get_rows_8x8_vcr(ch) : get_rows_5x7(ch);
+            std::vector<uint8_t> out(16, 0x00);
+            int src_h = static_cast<int>(src.size());
+            int active_h = compressed ? 12 : 16;
+            int y_off = compressed ? 2 : 0;
+
+            for (int y = 0; y < 16; y++) {
+              if (y < y_off || y >= y_off + active_h) {
+                out[y] = 0x00;
+                continue;
+              }
+              int yy = y - y_off;
+              int sy = (yy * (src_h - 1)) / (active_h - 1);
+              uint8_t row = src[sy];
+              uint8_t line = 0;
+              int src_w = vcr ? 8 : 5;
+              int dst_shift = vcr ? 0 : 1;
+              for (int x = 0; x < src_w; x++) {
+                if (row & (1 << (src_w - 1 - x))) {
+                  int bit = 7 - (x + dst_shift);
+                  if (bit >= 0) {
+                    line |= (1 << bit);
+                  }
+                }
+              }
+              if (bold) {
+                line |= (line >> 1);
+              }
+              out[y] = line;
+            }
+
+            for (int i = 0; i < 16; i += 2) {
+              uint16_t val = out[i] | (out[i + 1] << 8);
+              uint16_t rev = reverse_bits_16(val);
+              out[i] = (rev >> 8) & 0xFF;
+              out[i + 1] = rev & 0xFF;
+            }
+            return out;
+          };
+
+          // pypixelcolor-compatible payload for 16px text.
+          std::vector<uint8_t> data_payload;
+          data_payload.push_back(static_cast<uint8_t>(msg.size())); // number_of_characters
+
+          uint8_t animation = static_cast<uint8_t>(roundf(id(text_animation).state));
+          uint8_t speed = static_cast<uint8_t>(roundf(id(text_speed).state));
+          uint8_t rainbow_mode = 0;
+          uint8_t color_r = 0xFF;
+          uint8_t color_g = 0xFF;
+          uint8_t color_b = 0xFF;
+
+          data_payload.push_back(0x00);
+          data_payload.push_back(0x01);
+          data_payload.push_back(0x01);
+          data_payload.push_back(animation);
+          data_payload.push_back(speed);
+          data_payload.push_back(rainbow_mode);
+          data_payload.push_back(color_r);
+          data_payload.push_back(color_g);
+          data_payload.push_back(color_b);
+          data_payload.push_back(0x00);
+          data_payload.push_back(0x00);
+          data_payload.push_back(0x00);
+          data_payload.push_back(0x00);
+
+          for (char c : msg) {
+            bool bold = id(text_font).state == "Bold";
+            bool vcr = id(text_font).state == "VCR";
+            bool compressed = id(text_height).state == "Compressed";
+            char glyph_char = c;
+            if (vcr && glyph_char >= 'a' && glyph_char <= 'z') {
+              glyph_char = static_cast<char>(glyph_char - 32);
+            }
+            std::vector<uint8_t> glyph = encode_char_8x16(glyph_char, bold, vcr, compressed);
+
+            data_payload.push_back(0x00); // 16x8 char block
+            data_payload.push_back(color_r);
+            data_payload.push_back(color_g);
+            data_payload.push_back(color_b);
+            data_payload.insert(data_payload.end(), glyph.begin(), glyph.end());
+          }
+
+          uint32_t payload_size = data_payload.size();
+          uint32_t crc = crc32(data_payload.data(), data_payload.size());
+
+          // Build one or more protocol windows (12 KiB window size).
+          const size_t WINDOW_SIZE = 12 * 1024;
+          const uint8_t SAVE_SLOT = 0x00;
+          std::vector<uint8_t> full_message;
+
+          size_t pos = 0;
+          int window_index = 0;
+          while (pos < data_payload.size()) {
+            size_t end = std::min(pos + WINDOW_SIZE, data_payload.size());
+            std::vector<uint8_t> chunk_payload(data_payload.begin() + pos, data_payload.begin() + end);
+
+            uint8_t option = (window_index == 0) ? 0x00 : 0x02;
+
+            std::vector<uint8_t> frame;
+            frame.push_back(0x00);
+            frame.push_back(0x01);
+            frame.push_back(option);
+
+            frame.push_back(payload_size & 0xFF);
+            frame.push_back((payload_size >> 8) & 0xFF);
+            frame.push_back((payload_size >> 16) & 0xFF);
+            frame.push_back((payload_size >> 24) & 0xFF);
+
+            frame.push_back(crc & 0xFF);
+            frame.push_back((crc >> 8) & 0xFF);
+            frame.push_back((crc >> 16) & 0xFF);
+            frame.push_back((crc >> 24) & 0xFF);
+
+            frame.push_back(0x00);
+            frame.push_back(SAVE_SLOT);
+            frame.insert(frame.end(), chunk_payload.begin(), chunk_payload.end());
+
+            uint16_t frame_len = frame.size() + 2;
+            full_message.push_back(frame_len & 0xFF);
+            full_message.push_back((frame_len >> 8) & 0xFF);
+            full_message.insert(full_message.end(), frame.begin(), frame.end());
+
+            pos = end;
+            window_index++;
+          }
+
+          // Fragment for BLE write command.
+          const size_t MAX_CHUNK_SIZE = 300;
+          std::vector<std::vector<uint8_t>> ble_chunks;
+          size_t offset = 0;
+          while (offset < full_message.size()) {
+            size_t chunk_size = std::min(MAX_CHUNK_SIZE, full_message.size() - offset);
+            std::vector<uint8_t> chunk(full_message.begin() + offset, full_message.begin() + offset + chunk_size);
+            ble_chunks.push_back(chunk);
+            offset += chunk_size;
+          }
+
+          id(text_command_chunks) = ble_chunks;
+          id(text_chunk_index) = 0;
+
+          ESP_LOGI("text", "Text command ready: chars=%u, payload=%u, packet=%u, chunks=%u",
+                   msg.size(), data_payload.size(), full_message.size(), ble_chunks.size());
+          id(send_text_ble).execute();
+      - select.set:
+          id: clock_style
+          option: Disabled

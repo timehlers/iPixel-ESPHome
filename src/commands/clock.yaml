@@ -26,6 +26,7 @@ select:
       - "Style 6"
       - "Style 7"
       - "Style 8"
+      - "Style 9"
     on_value:
       # - if:
       #     condition:
